@@ -336,14 +336,14 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 room.devices,
                 key=lambda d: LOCAL_DEVICE_PRIORITY.get(d.device_type, 99),
             ):
-                matter_device = device_registry.async_get_device(
-                    identifiers={("matter", f"serial_{device.serial_number}")}
-                )
-                if matter_device is None:
-                    continue
                 entity_id = next(
                     (
                         entry.entity_id
+                        for matter_device in device_registry.async_get_devices(
+                            identifiers={
+                                ("matter", f"serial_{device.serial_number}")
+                            }
+                        )
                         for entry in er.async_entries_for_device(
                             entity_registry, matter_device.id
                         )

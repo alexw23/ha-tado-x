@@ -2,6 +2,12 @@
 
 Changes in this fork, on top of [exabird/ha-tado-x](https://github.com/exabird/ha-tado-x) v1.8.11.
 
+## 1.9.1
+
+### Fixed
+
+- Finding a room's Matter device no longer uses a device registry call that stops working in Home Assistant 2027.8.
+
 ## 1.9.0
 
 ### Added
