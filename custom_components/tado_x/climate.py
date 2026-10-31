@@ -108,14 +108,25 @@ class TadoXClimate(CoordinatorEntity[TadoXDataUpdateCoordinator], ClimateEntity)
         return room.connection_state == "CONNECTED"
 
     @property
+    def _local(self) -> tuple[float | None, float | None, bool] | None:
+        """Return (temperature, setpoint, is_off) from Matter, if this room has it."""
+        return self.coordinator.local_reading(self._room_id)
+
+    @property
     def current_temperature(self) -> float | None:
-        """Return the current temperature."""
+        """Return the current temperature, preferring Matter's live reading."""
+        local = self._local
+        if local and local[0] is not None:
+            return local[0]
         room = self._room
         return room.current_temperature if room else None
 
     @property
     def target_temperature(self) -> float | None:
-        """Return the target temperature."""
+        """Return the target temperature, preferring Matter's live setpoint."""
+        local = self._local
+        if local:
+            return None if local[2] else local[1]
         room = self._room
         if not room:
             return None
@@ -145,6 +156,15 @@ class TadoXClimate(CoordinatorEntity[TadoXDataUpdateCoordinator], ClimateEntity)
             room.manual_control_active,
         )
 
+        # Matter knows about on and off first. It can't tell a schedule from a
+        # manual setting, so the API still decides between AUTO and HEAT.
+        local = self._local
+        if local:
+            if local[2]:
+                return HVACMode.OFF
+            if room.power == "OFF" and room.manual_control_active:
+                return HVACMode.HEAT
+
         # If manual control is active with power OFF, it's truly OFF
         # (user explicitly turned off the heating)
         if room.power == "OFF" and room.manual_control_active:
@@ -163,10 +183,7 @@ class TadoXClimate(CoordinatorEntity[TadoXDataUpdateCoordinator], ClimateEntity)
     def hvac_action(self) -> HVACAction:
         """Return the current HVAC action."""
         room = self._room
-        if not room:
-            return HVACAction.OFF
-
-        if room.power == "OFF":
+        if not room or self.hvac_mode == HVACMode.OFF:
             return HVACAction.OFF
 
         if room.heating_power > 0:
@@ -210,6 +227,7 @@ class TadoXClimate(CoordinatorEntity[TadoXDataUpdateCoordinator], ClimateEntity)
         attrs: dict[str, Any] = {
             "heating_power": room.heating_power,
             "manual_control_active": room.manual_control_active,
+            "local_entity": self.coordinator.local_entity(self._room_id),
         }
 
         if room.manual_control_active:

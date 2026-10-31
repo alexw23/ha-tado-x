@@ -10,6 +10,8 @@ import aiohttp
 import ssl
 
 from .const import (
+    QUOTA_RESET_HOUR_UTC,
+    QUOTA_RESET_MINUTE_UTC,
     TADO_AUTH_URL,
     TADO_CLIENT_ID,
     TADO_EIQ_API_URL,
@@ -20,6 +22,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# No call waits on the session's five-minute default; requests run one at a time,
+# so a stuck one would hold up everything behind it.
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+MIN_CALL_SPACING = 1.0  # seconds between any two API calls
 
 
 class TadoXAuthError(Exception):
@@ -62,15 +69,18 @@ class TadoXApi:
         self._has_auto_assist = has_auto_assist
         self._on_token_refresh = on_token_refresh
 
+        self._request_lock = asyncio.Lock()
+        self._last_call: float = 0.0
+
         # Initialize API call tracking with persistence support
-        # Tado resets quotas at 12:00 UTC (noon), not midnight
         now = datetime.now(timezone.utc)
         default_reset_time = self._calculate_next_reset_time(now)
 
         if api_reset_time and api_reset_time > now:
-            # Restore persisted values if reset time hasn't passed
+            # Restore persisted values if reset time hasn't passed. The earlier of
+            # the two wins, so a date saved under the old noon rule can't stick.
             self._api_calls_today = api_calls_today
-            self._api_call_reset_time = api_reset_time
+            self._api_call_reset_time = min(api_reset_time, default_reset_time)
         else:
             # Reset counter if new period or no persisted data
             self._api_calls_today = 0
@@ -139,8 +149,8 @@ class TadoXApi:
     def _calculate_next_reset_time(now: datetime) -> datetime:
         """Calculate the next API quota reset time.
 
-        Tado resets quotas at 12:00 UTC (noon). This method calculates
-        the next reset time based on the current time.
+        This is the starting estimate; rate limit headers and observed resets
+        replace it (see _parse_rate_limit_headers).
 
         Args:
             now: Current datetime in UTC
@@ -148,12 +158,15 @@ class TadoXApi:
         Returns:
             Next reset time as datetime in UTC
         """
-        # Reset time is 12:00 UTC
-        reset_hour = 12
-        today_reset = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
+        today_reset = now.replace(
+            hour=QUOTA_RESET_HOUR_UTC,
+            minute=QUOTA_RESET_MINUTE_UTC,
+            second=0,
+            microsecond=0,
+        )
 
         if now >= today_reset:
-            # Already past today's reset, next reset is tomorrow at noon
+            # Already past today's reset, next reset is tomorrow
             return today_reset + timedelta(days=1)
         else:
             # Today's reset hasn't happened yet
@@ -165,6 +178,7 @@ class TadoXApi:
         Tado returns rate limit info in these headers:
         - ratelimit-policy: "perday";q=20000;w=86400 (q=quota limit, w=window in seconds)
         - ratelimit: "perday";r=17833 (r=remaining requests)
+          and, when Tado sends it, t=seconds until the window resets
         """
         import re
 
@@ -185,7 +199,22 @@ class TadoXApi:
             # Extract r=NUMBER from the header
             remaining_match = re.search(r"r=(\d+)", ratelimit_header)
             if remaining_match:
-                self._api_quota_remaining = int(remaining_match.group(1))
+                remaining = int(remaining_match.group(1))
+                now = datetime.now(timezone.utc)
+                # The count only ever falls within a window, so a rise is a reset.
+                # Tado's window is 24 hours, which puts the next one a day from now.
+                previous = self._api_quota_remaining
+                if previous is not None and remaining > previous:
+                    self._api_calls_today = 1
+                    self._api_call_reset_time = now + timedelta(days=1)
+                    _LOGGER.debug("Quota reset observed, %s remaining", remaining)
+                self._api_quota_remaining = remaining
+
+                reset_match = re.search(r"\bt=(\d+)", ratelimit_header)
+                if reset_match:
+                    self._api_call_reset_time = now + timedelta(
+                        seconds=int(reset_match.group(1))
+                    )
 
     async def start_device_auth(self) -> dict[str, Any]:
         """Start the device authorization flow.
@@ -290,7 +319,15 @@ class TadoXApi:
                     "refresh_token": self._refresh_token,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=REQUEST_TIMEOUT,
             ) as response:
+                # Only a refusal means the login is bad. Calling anything else an
+                # auth failure stops polling until a restart: Home Assistant stops
+                # rescheduling a coordinator that reports ConfigEntryAuthFailed.
+                if response.status == 429 or response.status >= 500:
+                    raise TadoXApiError(
+                        f"Token endpoint unavailable: {response.status}"
+                    )
                 if response.status != 200:
                     text = await response.text()
                     _LOGGER.error("Failed to refresh token: %s - %s", response.status, text)
@@ -309,8 +346,8 @@ class TadoXApi:
                 _LOGGER.debug("Token refreshed successfully, expires in %s seconds", expires_in)
                 return True
 
-        except aiohttp.ClientError as err:
-            raise TadoXAuthError(f"Network error during token refresh: {err}") from err
+        except (aiohttp.ClientError, TimeoutError) as err:
+            raise TadoXApiError(f"Network error during token refresh: {err}") from err
 
     async def _ensure_valid_token(self) -> None:
         """Ensure we have a valid access token."""
@@ -327,7 +364,24 @@ class TadoXApi:
         url: str,
         json_data: dict | None = None,
     ) -> dict | list | None:
-        """Make an authenticated API request."""
+        """Make an authenticated API request, one at a time and spaced apart."""
+        async with self._request_lock:
+            loop = asyncio.get_running_loop()
+            wait = self._last_call + MIN_CALL_SPACING - loop.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                return await self._send_request(method, url, json_data)
+            finally:
+                self._last_call = loop.time()
+
+    async def _send_request(
+        self,
+        method: str,
+        url: str,
+        json_data: dict | None = None,
+    ) -> dict | list | None:
+        """Send one request."""
         await self._ensure_valid_token()
 
         # Track API call
@@ -350,6 +404,7 @@ class TadoXApi:
                 url,
                 headers=headers,
                 json=json_data,
+                timeout=REQUEST_TIMEOUT,
             ) as response:
                 # Parse rate limit headers from Tado API
                 self._parse_rate_limit_headers(response.headers)
@@ -363,7 +418,9 @@ class TadoXApi:
                         url,
                         headers=headers,
                         json=json_data,
+                        timeout=REQUEST_TIMEOUT,
                     ) as retry_response:
+                        self._parse_rate_limit_headers(retry_response.headers)
                         if retry_response.status != 200:
                             text = await retry_response.text()
                             raise TadoXApiError(f"API error: {retry_response.status} - {text}")
@@ -391,7 +448,7 @@ class TadoXApi:
                     return None
                 return await response.json()
 
-        except aiohttp.ClientError as err:
+        except (aiohttp.ClientError, TimeoutError) as err:
             raise TadoXApiError(f"Network error: {err}") from err
 
     # My Tado API endpoints (user info)

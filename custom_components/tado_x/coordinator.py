@@ -6,17 +6,69 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Callable
 
-from homeassistant.core import HomeAssistant
+from homeassistant.components.climate import (
+    ATTR_CURRENT_TEMPERATURE,
+    DOMAIN as CLIMATE_DOMAIN,
+    HVACMode,
+)
+from homeassistant.const import ATTR_TEMPERATURE, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.core import (
+    CALLBACK_TYPE,
+    Event,
+    EventStateChangedData,
+    HassJob,
+    HomeAssistant,
+    callback,
+)
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_state_change_event,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .api import TadoXApi, TadoXApiError, TadoXAuthError, TadoXRateLimitError
-from .const import DOMAIN, SCAN_INTERVAL_AUTO_ASSIST, SCAN_INTERVAL_FREE_TIER
+from .const import (
+    DEVICE_TYPE_SENSOR,
+    DEVICE_TYPE_THERMOSTAT,
+    DEVICE_TYPE_VALVE,
+    DOMAIN,
+    SCAN_INTERVAL_AUTO_ASSIST,
+    SCAN_INTERVAL_FREE_TIER,
+)
+from .polling import PollPlan, PollPlanner, PollReason, QuotaLevel
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+# Which device speaks for a room when several of them are on Matter
+LOCAL_DEVICE_PRIORITY = {
+    DEVICE_TYPE_THERMOSTAT: 0,
+    DEVICE_TYPE_SENSOR: 1,
+    DEVICE_TYPE_VALVE: 2,
+}
+
+# How long a failing API may go unnoticed, showing the last data, before entities
+# turn unavailable. Without this, each DNS blip blanked them until the next poll.
+STALE_GRACE_SECONDS = 1800
+
+
+@dataclass
+class PollingStatus:
+    """Adaptive polling diagnostics."""
+
+    adaptive: bool = True
+    interval: float = 0.0  # seconds between the last poll and the next
+    last_update: datetime | None = None
+    next_update: datetime | None = None
+    reason: PollReason | None = None
+    level: QuotaLevel | None = None
+    last_error: str | None = None
+    rooms: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -125,6 +177,8 @@ class TadoXData:
     flow_temp_auto_adaptation: bool = False
     flow_temp_auto_value: int | None = None
     has_flow_temp_control: bool = False
+    # Adaptive polling diagnostics, shared with the coordinator
+    polling: PollingStatus = field(default_factory=PollingStatus)
 
 
 class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
@@ -143,6 +197,8 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
         enable_air_comfort: bool = True,
         enable_running_times: bool = True,
         enable_flow_temp: bool = True,
+        adaptive_polling: bool = True,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
         """Initialize the coordinator."""
         # Determine scan interval based on subscription tier if not explicitly set
@@ -152,11 +208,15 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 else SCAN_INTERVAL_FREE_TIER
             )
 
+        # Adaptive polling runs its own timer, so the base class must not run one.
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
-            update_interval=timedelta(seconds=scan_interval),
+            update_interval=(
+                None if adaptive_polling else timedelta(seconds=scan_interval)
+            ),
         )
         self.api = api
         self.home_id = home_id
@@ -172,9 +232,27 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
         self.enable_running_times = enable_running_times
         self.enable_flow_temp = enable_flow_temp
 
+        # Adaptive polling
+        self.adaptive_polling = adaptive_polling
+        self.planner = PollPlanner()
+        self.polling_status = PollingStatus(adaptive=adaptive_polling)
+        self._poll_running = False
+        self._stopped = False
+        self._auth_failed = False
+        self._unsub_timer: CALLBACK_TYPE | None = None
+        self._unsub_local: CALLBACK_TYPE | None = None
+        self._local_by_room: dict[int, str] = {}
+        self._room_by_local: dict[str, int] = {}
+        self._last_success: float = 0.0
+        self._known_ids: set[int | str] | None = None
+        # The parts of a full refresh that light polls reuse
+        self._cached_rooms_devices: dict[str, Any] = {}
+        self._cached_home_state: dict[str, Any] = {}
+        self._cached_mobile_devices: list[dict[str, Any]] = []
+
         _LOGGER.info(
-            "Tado X coordinator initialized with %d second update interval (%s tier)",
-            scan_interval,
+            "Tado X coordinator initialized with %s (%s tier)",
+            "adaptive polling" if adaptive_polling else f"a {scan_interval} second interval",
             "Auto-Assist" if api.has_auto_assist else "Free"
         )
         _LOGGER.info(
@@ -183,10 +261,241 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
         )
 
     def update_scan_interval(self, new_interval: int) -> None:
-        """Update the scan interval dynamically."""
+        """Update the scan interval dynamically (fixed-interval mode only)."""
         self._scan_interval = new_interval
-        self.update_interval = timedelta(seconds=new_interval)
+        if not self.adaptive_polling:
+            self.update_interval = timedelta(seconds=new_interval)
         _LOGGER.info("Scan interval updated to %d seconds", new_interval)
+
+    # ── Adaptive polling ─────────────────────────────────────────────────────
+
+    @callback
+    def async_start_adaptive_polling(self) -> None:
+        """Start listening to Matter and schedule the next poll."""
+        if not self.adaptive_polling:
+            return
+        self._async_resolve_local_entities()
+        self._async_reschedule()
+        self.async_update_listeners()  # the sensors exist only now
+
+    @callback
+    def async_stop_adaptive_polling(self) -> None:
+        """Stop the timer and the Matter listener."""
+        self._stopped = True
+        self._async_cancel_timer()
+        if self._unsub_local:
+            self._unsub_local()
+            self._unsub_local = None
+
+    async def async_shutdown(self) -> None:
+        """Stop adaptive polling along with the coordinator."""
+        self.async_stop_adaptive_polling()
+        await super().async_shutdown()
+
+    async def async_request_refresh(self) -> None:
+        """Refresh after a command, through the planner so it can't double up."""
+        if not self.adaptive_polling:
+            await super().async_request_refresh()
+            return
+        self.planner.request_command_poll(dt_util.utcnow().timestamp())
+        self._async_reschedule()
+
+    def local_reading(
+        self, room_id: int
+    ) -> tuple[float | None, float | None, bool] | None:
+        """Return (temperature, setpoint, is_off) from Matter, if it has them."""
+        entity_id = self._local_by_room.get(room_id)
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+            return None
+        return (
+            state.attributes.get(ATTR_CURRENT_TEMPERATURE),
+            state.attributes.get(ATTR_TEMPERATURE),
+            state.state == HVACMode.OFF,
+        )
+
+    def local_entity(self, room_id: int) -> str | None:
+        """Return the Matter climate entity behind a room, if any."""
+        return self._local_by_room.get(room_id)
+
+    @callback
+    def _async_resolve_local_entities(self) -> None:
+        """Find each room's Matter climate entity from its Tado serial numbers.
+
+        Matter devices identify themselves as ("matter", "serial_<serial>"), with
+        the same serial number that Tado reports, so no setup is needed and a room
+        with no Matter device simply stays on API readings.
+        """
+        if not self.data:
+            return
+        device_registry = dr.async_get(self.hass)
+        entity_registry = er.async_get(self.hass)
+        found: dict[int, str] = {}
+        for room_id, room in self.data.rooms.items():
+            for device in sorted(
+                room.devices,
+                key=lambda d: LOCAL_DEVICE_PRIORITY.get(d.device_type, 99),
+            ):
+                matter_device = device_registry.async_get_device(
+                    identifiers={("matter", f"serial_{device.serial_number}")}
+                )
+                if matter_device is None:
+                    continue
+                entity_id = next(
+                    (
+                        entry.entity_id
+                        for entry in er.async_entries_for_device(
+                            entity_registry, matter_device.id
+                        )
+                        if entry.domain == CLIMATE_DOMAIN
+                        and entry.platform == "matter"
+                        and not entry.disabled
+                    ),
+                    None,
+                )
+                if entity_id:
+                    found[room_id] = entity_id
+                    break
+
+        if found == self._local_by_room and (self._unsub_local or not found):
+            return
+        self._local_by_room = found
+        self._room_by_local = {entity: room for room, entity in found.items()}
+        if self._unsub_local:
+            self._unsub_local()
+            self._unsub_local = None
+        if found and not self._stopped:
+            self._unsub_local = async_track_state_change_event(
+                self.hass, list(found.values()), self._async_local_state_changed
+            )
+        _LOGGER.debug("Local Matter entities by room: %s", found)
+
+    @callback
+    def _async_local_state_changed(self, event: Event[EventStateChangedData]) -> None:
+        """React to a Matter thermostat changing."""
+        room_id = self._room_by_local.get(event.data["entity_id"])
+        reading = self.local_reading(room_id) if room_id is not None else None
+        if reading is not None:
+            trigger = self.planner.update_reading(
+                room_id, *reading, dt_util.utcnow().timestamp()
+            )
+            if trigger:
+                _LOGGER.debug("Room %s: %s", room_id, trigger)
+            self._async_reschedule()
+        # Entities show Matter's temperature and setpoint straight away.
+        self.async_update_listeners()
+
+    @callback
+    def _async_cancel_timer(self) -> None:
+        """Cancel the pending poll."""
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+
+    @callback
+    def _async_reschedule(self) -> None:
+        """Set the timer for the planner's next poll."""
+        self._async_cancel_timer()
+        if not self.adaptive_polling or self._stopped or self._auth_failed:
+            return
+        now = dt_util.utcnow().timestamp()
+        plan = self.planner.plan_next(now)
+        self._async_update_status(plan, now)
+        if self.config_entry and self.config_entry.pref_disable_polling:
+            return
+        self._unsub_timer = async_call_later(
+            self.hass,
+            max(0.0, plan.at - now),
+            HassJob(self._async_timer_fired, "tado_x poll", cancel_on_shutdown=True),
+        )
+
+    @callback
+    def _async_timer_fired(self, _now: datetime) -> None:
+        """Run the poll that the timer was set for."""
+        self._unsub_timer = None
+        self.hass.async_create_background_task(
+            self._async_run_poll(), "tado_x poll"
+        )
+
+    async def _async_run_poll(self) -> None:
+        """Poll once; a poll already running covers this one."""
+        if self._poll_running:
+            return
+        self._poll_running = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._poll_running = False
+            self._async_reschedule()
+            self.async_update_listeners()
+
+    @callback
+    def _async_update_status(self, plan: PollPlan, now: float) -> None:
+        """Copy the plan into the diagnostics that sensors read."""
+        status = self.polling_status
+        status.interval = plan.interval
+        status.next_update = dt_util.utc_from_timestamp(plan.at)
+        status.reason = plan.reason
+        status.level = plan.level
+        names = self.data.rooms if self.data else {}
+        status.rooms = {
+            (names[room_id].name if room_id in names else str(room_id)): {
+                "source": "matter" if room_id in self._local_by_room else "api",
+                "local_entity": self._local_by_room.get(room_id),
+                "temperature": room.temperature,
+                "setpoint": room.setpoint,
+                "reason": room.reason.value,
+                "backoff_step": room.backoff_step,
+                "next_due": dt_util.utc_from_timestamp(room.next_due).isoformat(),
+            }
+            for room_id, room in self.planner.rooms.items()
+        }
+
+    @callback
+    def _async_after_poll(self, data: TadoXData, full: bool, now: float) -> None:
+        """Feed a successful poll to the planner and look for new hardware."""
+        data.polling = self.polling_status
+        self._last_success = now
+        self.polling_status.last_update = dt_util.utc_from_timestamp(now)
+        self.polling_status.last_error = None
+
+        self._async_check_for_new_hardware(data)
+        if not self.adaptive_polling:
+            return
+
+        self.planner.update_quota(
+            data.api_quota_remaining,
+            data.api_quota_limit,
+            data.api_reset_time.timestamp() if data.api_reset_time else None,
+        )
+        self.planner.set_rooms(set(data.rooms), now)
+        previous_data, self.data = self.data, data
+        if full or previous_data is None:
+            self._async_resolve_local_entities()
+        for room_id, room in data.rooms.items():
+            # Matter is current; the API is the fallback for rooms without it.
+            reading = self.local_reading(room_id) or (
+                room.current_temperature,
+                room.target_temperature,
+                room.power == "OFF",
+            )
+            self.planner.update_reading(room_id, *reading, now, just_polled=True)
+        self.planner.poll_succeeded(now, full)
+
+    @callback
+    def _async_check_for_new_hardware(self, data: TadoXData) -> None:
+        """Reload when a new room or device appears, so it gets its entities."""
+        current: set[int | str] = {*data.rooms, *data.devices}
+        if self._known_ids is None:
+            self._known_ids = current
+            return
+        if new := current - self._known_ids:
+            _LOGGER.info("New Tado rooms or devices found, reloading: %s", new)
+            self._known_ids |= new
+            if self.config_entry:
+                self.hass.config_entries.async_schedule_reload(
+                    self.config_entry.entry_id
+                )
 
     def get_api_calls_per_update(self) -> int:
         """Calculate the number of API calls per update based on enabled features."""
@@ -203,22 +512,36 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
         return calls
 
     async def _async_update_data(self) -> TadoXData:
-        """Fetch data from Tado X API."""
+        """Fetch data from Tado X API.
+
+        Rooms carry everything heating detection needs for one call, so most polls
+        read only those and reuse the rest from the last full refresh.
+        """
+        now = dt_util.utcnow().timestamp()
+        previous = self.data
+        full = (
+            not self.adaptive_polling
+            or previous is None
+            or self.planner.needs_full_refresh(now)
+        )
         try:
             # Get rooms with current state (required)
             rooms_data = await self.api.get_rooms()
 
-            # Get rooms with devices (required)
-            rooms_devices_data = await self.api.get_rooms_and_devices()
+            if full:
+                # Get rooms with devices (required)
+                self._cached_rooms_devices = await self.api.get_rooms_and_devices()
 
-            # Get home presence state (required)
-            home_state = await self.api.get_home_state()
+                # Get home presence state (required)
+                self._cached_home_state = await self.api.get_home_state()
+            rooms_devices_data = self._cached_rooms_devices
+            home_state = self._cached_home_state
             presence = home_state.get("presence")
             presence_locked = home_state.get("presenceLocked", False)
 
             # Get weather data (optional)
-            weather = None
-            if self.enable_weather:
+            weather = previous.weather if previous and self.enable_weather else None
+            if full and self.enable_weather:
                 weather_data = await self.api.get_weather()
                 outdoor_temp_data = weather_data.get("outsideTemperature") or {}
                 solar_data = weather_data.get("solarIntensity") or {}
@@ -231,9 +554,11 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 )
 
             # Get mobile devices for geofencing (optional)
-            mobile_devices_data = []
-            if self.enable_mobile_devices:
-                mobile_devices_data = await self.api.get_mobile_devices()
+            if not self.enable_mobile_devices:
+                self._cached_mobile_devices = []
+            elif full:
+                self._cached_mobile_devices = await self.api.get_mobile_devices()
+            mobile_devices_data = self._cached_mobile_devices
 
             # Process the data
             data = TadoXData(
@@ -410,8 +735,24 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 )
                 data.mobile_devices[device_id] = mobile_device
 
+            # Between full refreshes, the optional data stays as last fetched.
+            if not full and previous:
+                data.running_times = previous.running_times
+                data.air_comfort = previous.air_comfort
+                for room_id, room in data.rooms.items():
+                    if room_id in previous.rooms:
+                        room.running_time_today_seconds = previous.rooms[
+                            room_id
+                        ].running_time_today_seconds
+                data.has_flow_temp_control = previous.has_flow_temp_control
+                data.max_flow_temperature = previous.max_flow_temperature
+                data.flow_temp_min = previous.flow_temp_min
+                data.flow_temp_max = previous.flow_temp_max
+                data.flow_temp_auto_adaptation = previous.flow_temp_auto_adaptation
+                data.flow_temp_auto_value = previous.flow_temp_auto_value
+
             # Fetch running times data for today (optional)
-            if self.enable_running_times:
+            if full and self.enable_running_times:
                 try:
                     today = date.today().isoformat()
                     running_times_data = await self.api.get_running_times(today, today)
@@ -436,7 +777,7 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                     data.running_times = {}
 
             # Fetch air comfort data (optional)
-            if self.enable_air_comfort:
+            if full and self.enable_air_comfort:
                 try:
                     air_comfort_data = await self.api.get_air_comfort()
                     comfort_list = air_comfort_data.get("comfort", [])
@@ -464,7 +805,7 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                     _LOGGER.warning("Failed to fetch air comfort data: %s", err)
 
             # Fetch flow temperature optimization settings (if available and enabled)
-            if self.enable_flow_temp:
+            if full and self.enable_flow_temp:
                 try:
                     flow_data = await self.api.get_flow_temperature_optimization()
                     if flow_data:
@@ -500,6 +841,7 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
             if self._save_api_stats_callback:
                 self._save_api_stats_callback()
 
+            self._async_after_poll(data, full, now)
             return data
 
         except TadoXRateLimitError as err:
@@ -508,6 +850,13 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 "Rate limit hit. Suspending API calls until %s. Using cached data.",
                 err.reset_time,
             )
+            self.planner.update_quota(
+                self.api.api_quota_remaining,
+                self.api.api_quota_limit,
+                err.reset_time.timestamp() if err.reset_time else None,
+            )
+            self.planner.poll_rate_limited(now)
+            self.polling_status.last_error = str(err)
             if self.data:
                 # Return previous data with rate_limited flag set
                 self.data.rate_limited = True
@@ -519,15 +868,28 @@ class TadoXDataUpdateCoordinator(DataUpdateCoordinator[TadoXData]):
                 home_name=self.home_name,
                 rate_limited=True,
                 rate_limit_reset=err.reset_time,
+                polling=self.polling_status,
             )
         except TadoXAuthError as err:
             # Trigger reauthentication flow instead of just failing
             # This will prompt the user to re-authenticate via the UI
+            self._auth_failed = True
             raise ConfigEntryAuthFailed(
                 f"Authentication failed: {err}. Please re-authenticate."
             ) from err
         except TadoXApiError as err:
+            self.planner.poll_failed(now)
+            self.polling_status.last_error = str(err)
+            if (
+                self.adaptive_polling
+                and previous
+                and now - self._last_success < STALE_GRACE_SECONDS
+            ):
+                _LOGGER.warning("Tado API call failed, keeping the last data: %s", err)
+                return previous
             raise UpdateFailed(f"API error: {err}") from err
         except Exception as err:
+            self.planner.poll_failed(now)
+            self.polling_status.last_error = str(err)
             _LOGGER.exception("Unexpected error fetching Tado X data")
             raise UpdateFailed(f"Unexpected error: {err}") from err

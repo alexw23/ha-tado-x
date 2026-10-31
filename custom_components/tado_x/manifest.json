@@ -1,11 +1,18 @@
 {
   "domain": "tado_x",
   "name": "Tado X",
-  "codeowners": ["@exabird"],
+  "codeowners": [
+    "@alexw23"
+  ],
+  "after_dependencies": [
+    "matter"
+  ],
   "config_flow": true,
-  "documentation": "https://github.com/exabird/ha-tado-x",
+  "documentation": "https://github.com/alexw23/ha-tado-x",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/exabird/ha-tado-x/issues",
-  "requirements": ["aiohttp>=3.8.0"],
-  "version": "1.8.11"
+  "issue_tracker": "https://github.com/alexw23/ha-tado-x/issues",
+  "requirements": [
+    "aiohttp>=3.8.0"
+  ],
+  "version": "1.9.0"
 }
