@@ -17,6 +17,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import TadoXApi, TadoXApiError, TadoXAuthError
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_ADAPTIVE_POLLING,
     CONF_API_CALLS_TODAY,
     CONF_API_RESET_TIME,
     CONF_ENABLE_AIR_COMFORT,
@@ -172,6 +173,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     except TadoXAuthError as err:
         _LOGGER.error("Authentication failed: %s", err)
         raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
+    except TadoXApiError as err:
+        raise ConfigEntryNotReady(f"Cannot reach Tado: {err}") from err
 
     # Create callback to save API stats periodically
     def save_api_stats() -> None:
@@ -211,6 +214,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         enable_air_comfort=enable_air_comfort,
         enable_running_times=enable_running_times,
         enable_flow_temp=enable_flow_temp,
+        adaptive_polling=entry.data.get(CONF_ADAPTIVE_POLLING, True),
+        config_entry=entry,
     )
 
     # Fetch initial data
@@ -225,6 +230,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Register services
     async def async_set_temperature_offset(call: ServiceCall) -> None:
         """Handle set_temperature_offset service call."""
+        coordinator = hass.data[DOMAIN][entry.entry_id]
         device_id = call.data[ATTR_DEVICE_ID]
         offset = call.data[ATTR_OFFSET]
 
@@ -283,6 +289,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_add_meter_reading(call: ServiceCall) -> None:
         """Handle add_meter_reading service call."""
+        coordinator = hass.data[DOMAIN][entry.entry_id]
         reading = call.data[ATTR_READING]
         date = call.data.get(ATTR_DATE)
 
@@ -304,6 +311,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_set_eiq_tariff(call: ServiceCall) -> None:
         """Handle set_eiq_tariff service call."""
+        coordinator = hass.data[DOMAIN][entry.entry_id]
         tariff = call.data[ATTR_TARIFF]
         unit = call.data[ATTR_UNIT]
         start_date = call.data.get(ATTR_START_DATE)
@@ -327,6 +335,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     async def async_set_climate_timer(call: ServiceCall) -> None:
         """Handle set_climate_timer service call."""
+        coordinator = hass.data[DOMAIN][entry.entry_id]
         entity_id = call.data[ATTR_ENTITY_ID]
         temperature = call.data[ATTR_TEMPERATURE]
         duration_minutes = call.data[ATTR_DURATION]
@@ -409,6 +418,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    coordinator.async_start_adaptive_polling()
+    entry.async_on_unload(coordinator.async_stop_adaptive_polling)
 
     return True
 

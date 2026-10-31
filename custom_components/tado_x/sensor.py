@@ -13,13 +13,19 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTemperature, UnitOfTime
+from homeassistant.const import (
+    EntityCategory,
+    PERCENTAGE,
+    UnitOfTemperature,
+    UnitOfTime,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import API_QUOTA_FREE_TIER, API_QUOTA_PREMIUM, DOMAIN
+from .polling import PollReason, QuotaLevel
 from .coordinator import (
     TadoXData,
     TadoXDataUpdateCoordinator,
@@ -71,6 +77,7 @@ class TadoXHomeSensorEntityDescription(SensorEntityDescription):
     """Describes a Tado X home sensor entity."""
 
     value_fn: Callable[[TadoXData], Any]
+    attributes_fn: Callable[[TadoXData], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -205,7 +212,65 @@ def _get_presence_mode(data: TadoXData) -> str:
     return "AUTO"
 
 
+def _get_polling_attributes(data: TadoXData) -> dict[str, Any]:
+    """Return how the polling decision was reached, room by room."""
+    status = data.polling
+    return {
+        "adaptive": status.adaptive,
+        "last_error": status.last_error,
+        "rooms": status.rooms,
+    }
+
+
 HOME_SENSORS: tuple[TadoXHomeSensorEntityDescription, ...] = (
+    TadoXHomeSensorEntityDescription(
+        key="polling_interval",
+        translation_key="polling_interval",
+        icon="mdi:timer-sync-outline",
+        native_unit_of_measurement=UnitOfTime.MINUTES,
+        device_class=SensorDeviceClass.DURATION,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=1,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: (
+            round(data.polling.interval / 60, 2) if data.polling.adaptive else None
+        ),
+        attributes_fn=_get_polling_attributes,
+    ),
+    TadoXHomeSensorEntityDescription(
+        key="last_api_update",
+        translation_key="last_api_update",
+        icon="mdi:cloud-check-outline",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.polling.last_update,
+    ),
+    TadoXHomeSensorEntityDescription(
+        key="next_api_update",
+        translation_key="next_api_update",
+        icon="mdi:cloud-clock-outline",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.polling.next_update,
+    ),
+    TadoXHomeSensorEntityDescription(
+        key="polling_reason",
+        translation_key="polling_reason",
+        icon="mdi:help-circle-outline",
+        device_class=SensorDeviceClass.ENUM,
+        options=[reason.value for reason in PollReason],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.polling.reason,
+    ),
+    TadoXHomeSensorEntityDescription(
+        key="quota_level",
+        translation_key="quota_level",
+        icon="mdi:gauge",
+        device_class=SensorDeviceClass.ENUM,
+        options=[level.value for level in QuotaLevel],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda data: data.polling.level,
+    ),
     TadoXHomeSensorEntityDescription(
         key="api_calls_today",
         translation_key="api_calls_today",
@@ -367,6 +432,7 @@ class TadoXHomeSensor(CoordinatorEntity[TadoXDataUpdateCoordinator], SensorEntit
     """Tado X home sensor entity."""
 
     _attr_has_entity_name = True
+    _unrecorded_attributes = frozenset({"rooms"})
     entity_description: TadoXHomeSensorEntityDescription
 
     def __init__(
@@ -392,6 +458,12 @@ class TadoXHomeSensor(CoordinatorEntity[TadoXDataUpdateCoordinator], SensorEntit
     def native_value(self) -> Any:
         """Return the sensor value."""
         return self.entity_description.value_fn(self.coordinator.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Return extra attributes, for the sensors that have any."""
+        attributes_fn = self.entity_description.attributes_fn
+        return attributes_fn(self.coordinator.data) if attributes_fn else None
 
     @callback
     def _handle_coordinator_update(self) -> None:

@@ -6,6 +6,8 @@
 
 A Home Assistant custom integration for **Tado X** devices (the new generation of Tado smart thermostats and radiator valves).
 
+> **Fork:** This is [alexw23's fork](https://github.com/alexw23/ha-tado-x) of [exabird/ha-tado-x](https://github.com/exabird/ha-tado-x), adding quota-aware adaptive polling. See the [changelog](CHANGELOG.md). Install it in HACS as a custom repository.
+
 > **Note:** This integration is specifically designed for Tado X devices. For older Tado devices (V3+ and earlier), use the [official Tado integration](https://www.home-assistant.io/integrations/tado/).
 
 ---
@@ -88,19 +90,35 @@ These sensors use **real values from Tado API response headers** when available,
 
 ## API Rate Limits & Smart Polling
 
-Tado enforces daily API limits. This integration **automatically adapts** its polling interval based on your subscription:
+Tado enforces a daily API limit, which this integration reads from the API's response headers. It times its calls from local readings and the quota that's left.
 
-| Subscription | Daily Limit | Auto Polling Interval | Actual Usage |
-|--------------|-------------|----------------------|--------------|
-| Without Auto-Assist | 5000 requests/day | Every 45 minutes | ~96 req/day ✅ |
-| With Auto-Assist | 20,000 requests/day | Every 30 seconds | ~2,880 req/day ✅ |
+### Adaptive polling
+
+Polling is per home, because one call returns every room. Each room says when it next needs fresh data, and the earliest room wins.
+
+| Room state | Poll interval |
+|---|---|
+| More than 0.5°C above the setpoint | 30 minutes |
+| From the setpoint to 0.5°C above it | 3 minutes |
+| Below the setpoint | 5 minutes |
+| Off, or no reading to compare | 30 minutes |
+
+- **Local triggers:** if a room's Tado device is also paired through the Home Assistant Matter integration, it's found by serial number with no setup. A setpoint or mode change, or a 0.1°C temperature change, then triggers a poll, followed by backoff steps of 1, 2, 4, 8 and 12 minutes. A temperature flicking back to its previous value within 10 minutes is ignored.
+- **Without Matter:** rooms use API readings. Changes start the backoff when a poll sees them, and nothing triggers a poll between polls.
+- **Cheaper polls:** most polls read rooms only (1 call). Devices, presence and optional features refresh hourly.
+- **Low quota:** intervals stretch as the quota runs down, and rooms that could be heating are the last to slow. Temperature triggers stop before setpoint triggers, and polling pauses near zero until the quota resets.
+- **Spacing:** one poll at a time, at least 60 seconds apart (15 seconds after a setpoint change or command), and at least 1 second between API calls.
+- **API trouble:** failed polls retry after 1, 2, 4 and then every 8 minutes, and entities keep their last values for 30 minutes.
+
+Diagnostic sensors: **Polling interval** (per-room detail in its attributes), **Last API update**, **Next API update**, **Polling reason** and **Quota level**.
 
 ### Configuration Options
 
 Go to **Settings** → **Devices & Services** → **Tado X** → **⚙️ Configure** to:
 
 - **Enable Auto-Assist**: Toggle if you have an Auto-Assist subscription
-- **Custom polling interval**: Override the automatic interval (30s - 3600s)
+- **Adaptive polling**: On by default. Turn it off to poll at a fixed interval instead
+- **Custom polling interval**: The fixed interval used when adaptive polling is off (30s - 3600s)
 - **Enable weather sensors**: Outdoor temperature, solar intensity, weather state (+1 API call)
 - **Enable mobile device tracking**: Device tracker for geofencing (+1 API call)
 - **Enable air comfort sensors**: Air freshness and comfort level per room (+1 API call)

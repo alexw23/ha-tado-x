@@ -15,6 +15,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .api import TadoXApi, TadoXAuthError
 from .const import (
     CONF_ACCESS_TOKEN,
+    CONF_ADAPTIVE_POLLING,
     CONF_ENABLE_AIR_COMFORT,
     CONF_ENABLE_FLOW_TEMP,
     CONF_ENABLE_MOBILE_DEVICES,
@@ -265,6 +266,10 @@ class TadoXOptionsFlow(OptionsFlow):
         if user_input is not None:
             has_auto_assist = user_input[CONF_HAS_AUTO_ASSIST]
             custom_interval = user_input.get(CONF_SCAN_INTERVAL)
+            adaptive_polling = user_input[CONF_ADAPTIVE_POLLING]
+            adaptive_changed = adaptive_polling != self.config_entry.data.get(
+                CONF_ADAPTIVE_POLLING, True
+            )
 
             # Get feature toggles
             enable_weather = user_input.get(CONF_ENABLE_WEATHER, has_auto_assist)
@@ -292,6 +297,7 @@ class TadoXOptionsFlow(OptionsFlow):
                 CONF_ENABLE_AIR_COMFORT: enable_air_comfort,
                 CONF_ENABLE_RUNNING_TIMES: enable_running_times,
                 CONF_ENABLE_FLOW_TEMP: enable_flow_temp,
+                CONF_ADAPTIVE_POLLING: adaptive_polling,
             }
             self.hass.config_entries.async_update_entry(
                 self.config_entry,
@@ -309,6 +315,13 @@ class TadoXOptionsFlow(OptionsFlow):
                 coordinator.enable_air_comfort = enable_air_comfort
                 coordinator.enable_running_times = enable_running_times
                 coordinator.enable_flow_temp = enable_flow_temp
+                if adaptive_changed:
+                    self.hass.config_entries.async_schedule_reload(
+                        self.config_entry.entry_id
+                    )
+                else:
+                    # Fetch anything that has just been switched on.
+                    await coordinator.async_request_refresh()
 
             return self.async_create_entry(title="", data={})
 
@@ -337,6 +350,10 @@ class TadoXOptionsFlow(OptionsFlow):
                     vol.Required(
                         CONF_HAS_AUTO_ASSIST,
                         default=current_auto_assist,
+                    ): bool,
+                    vol.Required(
+                        CONF_ADAPTIVE_POLLING,
+                        default=self.config_entry.data.get(CONF_ADAPTIVE_POLLING, True),
                     ): bool,
                     vol.Optional(
                         CONF_SCAN_INTERVAL,

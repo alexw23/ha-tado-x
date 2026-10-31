@@ -35,8 +35,16 @@ API_QUOTA_FREE_TIER: Final = 100  # requests per day without Auto-Assist
 API_QUOTA_PREMIUM: Final = 20000  # requests per day with Auto-Assist
 API_CALLS_PER_UPDATE: Final = 6  # get_rooms + get_rooms_and_devices + get_home_state + get_weather + get_mobile_devices + get_running_times
 
+# When the daily quota resets. Upstream assumed 12:00 UTC, but this account's
+# remaining count jumped back to ~1000 between 06:24 and 06:26 UTC on every day
+# from 22 to 31 Oct 2026, either side of the clocks changing. The API client moves
+# this if the rate limit headers or an observed reset say otherwise.
+QUOTA_RESET_HOUR_UTC: Final = 6
+QUOTA_RESET_MINUTE_UTC: Final = 25
+
 # Config keys for options
 CONF_SCAN_INTERVAL: Final = "scan_interval"
+CONF_ADAPTIVE_POLLING: Final = "adaptive_polling"
 
 # Feature toggles for optional API calls
 CONF_ENABLE_WEATHER: Final = "enable_weather"
